@@ -9,9 +9,86 @@ from threadpoolctl import threadpool_limits
 from pandas.api.types import is_numeric_dtype
 from multiprocessing import Pool
 import itertools
+from statsmodels.stats.multitest import fdrcorrection
 
 
-def scvi_rank_genes_groups(adata: AnnData, model, *, groupby: str):
+def de_res_to_anndata(
+    adata: AnnData,
+    de_res: pd.DataFrame,
+    *,
+    groupby: str,
+    gene_id_col: str = "gene_symbol",
+    score_col: str = "score",
+    pval_col: str = "pvalue",
+    pval_adj_col: Optional[str] = None,
+    lfc_col: str = "lfc",
+    key_added: str = "rank_genes_groups",
+) -> None:
+    """Add a tabular differential expression result to AnnData as
+    if it was produced by scanpy.tl.rank_genes_groups.
+
+    Parameters
+    ----------
+    adata
+        annotated data matrix
+    de_res
+        Tablular de result
+    groupby
+        column in `de_res` that indicates the group. This column must
+        also exist in `adata.obs`.
+    gene_id_col
+        column in `de_res` that holds the gene identifiers
+    score_col
+        column in `de_res` that holds the score (results will be ordered by score).
+    pval_col
+        column in `de_res` that holds the unadjusted pvalue
+    pval_adj_col
+        column in `de_res` that holds the adjusted pvalue. If not specified, the
+        unadjusted pvalues will be FDR-adjusted.
+    lfc_col
+        column in `de_res` that holds the log fold change
+    key_added
+        key under which the results will be stored in adata.uns
+    """
+    if groupby not in adata.obs.columns or groupby not in de_res.columns:
+        raise ValueError("groupby column must exist in both adata and de_res. ")
+    res_dict = {
+        "params": {
+            "groupby": groupby,
+            "reference": "rest",
+            "method": "other",
+            "use_raw": True,
+            "layer": None,
+            "corr_method": "other",
+        },
+        "names": [],
+        "scores": [],
+        "pvals": [],
+        "pvals_adj": [],
+        "logfoldchanges": [],
+    }
+    df_groupby = de_res.groupby(groupby)
+    for _, tmp_df in df_groupby:
+        tmp_df = tmp_df.sort_values(score_col, ascending=False)
+        res_dict["names"].append(tmp_df[gene_id_col].values)
+        res_dict["scores"].append(tmp_df[score_col].values)
+        res_dict["pvals"].append(tmp_df[pval_col].values)
+        if pval_adj_col is not None:
+            res_dict["pvals_adj"].append(tmp_df[pval_adj_col].values)
+        res_dict["logfoldchanges"].append(tmp_df[lfc_col].values)
+
+    if pval_adj_col is None:
+        res_dict["pvals_adj"] = fdrcorrection(res_dict["pvals"])[1]
+
+    for key in ["names", "scores", "pvals", "pvals_adj", "logfoldchanges"]:
+        res_dict[key] = pd.DataFrame(
+            np.vstack(res_dict[key]).T,
+            columns=list(df_groupby.groups.keys()),
+        ).to_records(index=False, column_dtypes="O")
+    adata.uns[key_added] = res_dict
+
+
+def scvi(adata: AnnData, model, *, groupby: str):
     """Perform differential expression with scVI and add the results
     to anndata in the same format as `sc.tl.rank_gene_groups` does.
 
@@ -23,37 +100,6 @@ def scvi_rank_genes_groups(adata: AnnData, model, *, groupby: str):
         adata, groupby=groupby, batch_correction=True
     )
     de_res["score"] = np.sign(de_res["lfc_mean"]) * de_res["bayes_factor"]
-    res_dict = {
-        "params": {
-            "groupby": groupby,
-            "reference": "rest",
-            "method": "scVI change",
-            "use_raw": True,
-            "layer": None,
-            "corr_method": "scVI",
-        },
-        "names": [],
-        "scores": [],
-        "pvals": [],
-        "pvals_adj": [],
-        "logfoldchanges": [],
-    }
-    df_groupby = de_res.groupby("comparison")
-    for comparison, tmp_df in df_groupby:
-        tmp_df = tmp_df.sort_values("score", ascending=False)
-        res_dict["names"].append(tmp_df.index.values)
-        res_dict["scores"].append(tmp_df["score"].values)
-        res_dict["pvals"].append(tmp_df["proba_not_de"].values)
-        # scvi pvalues are already adjusted
-        res_dict["pvals_adj"] = res_dict["pvals"]
-        res_dict["logfoldchanges"].append(tmp_df["lfc_mean"].values)
-
-    for key in ["names", "scores", "pvals", "pvals_adj", "logfoldchanges"]:
-        res_dict[key] = pd.DataFrame(
-            np.vstack(res_dict[key]).T,
-            columns=[c.split("vs")[0].strip() for c in df_groupby.groups.keys()],
-        ).to_records(index=False, column_dtypes="O")
-    adata.uns["rank_genes_groups"] = res_dict
     return de_res
 
 
@@ -75,10 +121,11 @@ def _fix_contrasts(contrasts, groupby):
 
 
 def _make_names(seq: Sequence):
+    """Turn a value into a valid R name"""
     return ["".join(e if e.isalnum() else "_" for e in string) for string in seq]
 
 
-def edger_rank_genes_groups(
+def edger(
     adata: AnnData,
     *,
     groupby: str,
@@ -214,7 +261,7 @@ def edger_rank_genes_groups(
         return ro.conversion.rpy2py(ro.globalenv["de_res"])
 
 
-def glmgampoi_rank_genes_groups(
+def glm_gam_poi(
     adata: AnnData,
     *,
     groupby: str,
@@ -339,3 +386,117 @@ def glmgampoi_rank_genes_groups(
         ro.default_converter + numpy2ri.converter + pandas2ri.converter
     ):
         return ro.conversion.rpy2py(ro.globalenv["de_res"])
+
+
+def mast(
+    adata: AnnData,
+    *,
+    groupby: str,
+    # contrasts: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    cofactors: Sequence[str] = None,
+    layer: Optional[str] = None,
+    n_cores_per_job: int = 4,
+    n_jobs: int = 4,
+):
+    """
+    Perform DE analysis using edgeR.
+
+    Requires that an R installation and the following packages are available
+
+        MAST
+
+    Install them with `conda install bioconductor-mast`.
+
+    Parameters
+    ----------
+    adata
+        annotated data matrix. X must contain normalized and log-transformed values.
+    groupby
+        The column in adata.obs to test for DE
+    cofactors
+        Additional columns to include into the model
+    layer
+        layer in adata that contains raw counts. If None, use `X`.
+    subsample_disp
+        Subsample cells to this nubmer during estimation of overdispersion.
+    n_cores_per_job
+        Number of cores to run per job (including BLAS parallelization)
+    n_jobs
+        Number of tests to run in parallel.
+    """
+
+    try:
+        from rpy2.robjects.packages import importr
+        from rpy2.robjects import pandas2ri, numpy2ri
+        from rpy2.robjects.conversion import localconverter
+        from rpy2 import robjects as ro
+        import anndata2ri
+
+    except ImportError:
+        raise ImportError("edger requires rpy2 to be installed. ")
+
+    try:
+        mast = importr("MAST")
+        blasctl = importr("RhpcBLASctl")
+        bcparallel = importr("BiocParallel")
+    except ImportError:
+        raise ImportError(
+            "GlmGamPoi requires a valid R installation with the following packages: "
+            "glmGamPoi, BiocParallal, RhpcBLASctl"
+        )
+
+    blasctl.blas_set_num_threads(1)
+    blasctl.omp_set_num_threads(1)
+    bcparallel.register(bcparallel.MulticoreParam(n_jobs))
+
+    logging.info("Preparing AnnData")
+    tmp_adata = AnnData(
+        X=adata.X if layer is None else adata.layers[layer],
+        obs=adata.obs,
+        var=adata.var,
+    )
+    tmp_adata.obs.columns = _make_names(tmp_adata.obs.columns)
+    tmp_adata.obs[groupby] = _make_names(tmp_adata.obs[groupby])
+    contrasts = []
+    for group in tmp_adata.obs[groupby].unique():
+        contrasts.append(f"is_group_{group}")
+        tmp_adata.obs[f"is_group_{group}"] = tmp_adata.obs[groupby] == group
+
+    logging.info("Preparing R objects")
+    with localconverter(anndata2ri.converter):
+        sce = ro.conversion.py2rpy(tmp_adata)
+    sca = mast.SceToSingleCellAssay(sce)
+    groupby = _make_names([groupby])[0]
+    if cofactors is not None:
+        cofactor_formula = "+ " + " + ".join(_make_names(cofactors))
+    else:
+        cofactor_formula = ""
+
+    logging.info("Running MAST")
+    ro.globalenv["cpus_per_thread"] = n_cores_per_job
+    ro.globalenv["contrasts"] = contrasts
+    ro.globalenv["cofactor_formula"] = cofactor_formula
+    ro.globalenv["sca"] = sca
+    ro.r(
+        """
+        library(dplyr)
+        de_res = bplapply(contrasts, function(model_col) {
+            op = options(mc.cores=cpus_per_thread)
+            on.exit(options(op))
+            contrast_to_test = paste0(model_col, "TRUE")
+            fit = zlm(as.formula(paste0("~", model_col, cofactor_formula)), sca)
+            res = summary(fit, doLRT=contrast_to_test)$datatable
+            merge(
+                res[contrast==contrast_to_test & component=='H', .(primerid, `Pr(>Chisq)`)], #P-vals
+                res[contrast==contrast_to_test & component=='logFC', .(primerid, coef)],
+                by='primerid'
+            ) %>% mutate(comparison=model_col)                  
+        }) %>% bind_rows()
+        """
+    )
+
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        de_res = ro.conversion.rpy2py(ro.globalenv["de_res"])
+
+    de_res["comparison"] = de_res["comparison"].str.replace("is_group_", "")
+    return de_res
