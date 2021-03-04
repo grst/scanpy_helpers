@@ -4,12 +4,41 @@ import numpy as np
 import pandas as pd
 from scanpy import logging, AnnData
 from scipy.sparse import issparse
-from typing import Sequence, Tuple, Optional
+from typing import Sequence, Tuple, Optional, Union, Literal, List
 from threadpoolctl import threadpool_limits
 from pandas.api.types import is_numeric_dtype
 from multiprocessing import Pool
 import itertools
 from statsmodels.stats.multitest import fdrcorrection
+
+
+def _make_names(seq: Union[str, Sequence[str]]) -> Union[str, List[str]]:
+    # TODO put this in util and make it explicit - just raise an error if the valuese
+    # don't match my requirements
+    """Turn a value into a valid R name.
+
+    Replaces all non-alphanumeric characters with an underscore.
+
+    Raises
+    ------
+    ValueError
+        if the number of unique elements in `seq` has been modified by the operation.
+    """
+
+    def _make_name(string):
+        return "".join(e if e.isalnum() else "_" for e in string)
+
+    if isinstance(seq, str):
+        return _make_name(seq)
+    else:
+        n_unique = len(set(seq))
+        seq_corrected = [_make_name(string) for string in seq]
+        if len(set(seq_corrected)) != n_unique:
+            raise ValueError(
+                "The object contains names that are ambiguous after replacing invalid "
+                "characters. Only alphanumeric characters and underscores are allowed. "
+            )
+        return seq_corrected
 
 
 def de_res_to_anndata(
@@ -75,10 +104,9 @@ def de_res_to_anndata(
         res_dict["pvals"].append(tmp_df[pval_col].values)
         if pval_adj_col is not None:
             res_dict["pvals_adj"].append(tmp_df[pval_adj_col].values)
+        else:
+            res_dict["pvals_adj"].append(fdrcorrection(tmp_df[pval_col].values)[1])
         res_dict["logfoldchanges"].append(tmp_df[lfc_col].values)
-
-    if pval_adj_col is None:
-        res_dict["pvals_adj"] = fdrcorrection(res_dict["pvals"])[1]
 
     for key in ["names", "scores", "pvals", "pvals_adj", "logfoldchanges"]:
         res_dict[key] = pd.DataFrame(
@@ -88,53 +116,47 @@ def de_res_to_anndata(
     adata.uns[key_added] = res_dict
 
 
-def scvi(adata: AnnData, model, *, groupby: str):
-    """Perform differential expression with scVI and add the results
-    to anndata in the same format as `sc.tl.rank_gene_groups` does.
+def scvi(
+    adata: AnnData, model, *, groupby: str, groups="all", **kwargs
+) -> pd.DataFrame:
+    """Perform differential expression with scVI.
 
-    Requires that an scvi model is trained on `adata`.
+    Essentially a wrapper around `scVI.differential_expression`.
 
-    Returns a table with results, adds gene ranks to `adata.uns`
+    Parameters
+    ----------
+    adata
+        annotated data matrix
+    model
+        scVI model trained on adata
+    groupby
+        column in adata.obs to use for the grouping.
+    groups
+        Subset of groups, e.g. `['g1', 'g2', 'g3']`, to which comparison shall
+        be restricted, or `'all'` (default), for all groups.
+    **kwargs
+        arguments passed to `scVI.differential_expression`
     """
     de_res = model.differential_expression(
-        adata, groupby=groupby, batch_correction=True
+        adata,
+        groupby=groupby,
+        batch_correction=True,
+        group1=None if groups == "all" else groups,
+        **kwargs,
     )
-    de_res["score"] = np.sign(de_res["lfc_mean"]) * de_res["bayes_factor"]
     return de_res
-
-
-def _fix_contrasts(contrasts, groupby):
-    """
-    Ensure that every contrast consists of two iterables.
-    Preprends the 'groupby' colname to the contrast to fit the design matrix.
-    """
-    tmp_contrasts = []
-    for a, b in contrasts:
-        if isinstance(a, str):
-            a = (a,)
-        if isinstance(b, str):
-            b = (b,)
-        a = [f"{groupby}{x}" for x in _make_names(a)]
-        b = [f"{groupby}{x}" for x in _make_names(b)]
-        tmp_contrasts.append((a, b))
-    return tmp_contrasts
-
-
-def _make_names(seq: Sequence):
-    """Turn a value into a valid R name"""
-    return ["".join(e if e.isalnum() else "_" for e in string) for string in seq]
 
 
 def edger(
     adata: AnnData,
     *,
     groupby: str,
-    contrasts: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    groups: Union[Literal["all"], Sequence[str]],
     cofactors: Sequence[str] = None,
     layer: Optional[str] = None,
     n_cores_per_job: int = 4,
     n_jobs: int = 4,
-):
+) -> pd.DataFrame:
     """
     Perform DE analysis using edgeR.
 
@@ -152,10 +174,9 @@ def edger(
         annotated data matrix
     groupby
         The column in adata.obs to test for DE
-    contrast
-        Liste of tuples with tests to perform, e.g.
-        `[('A', 'B'), (('A', 'B'), ('C', 'D','E'))]` which is equivalent to
-        `[(('A', ), ('B', )), (('A', 'B'), ('C', 'D','E'))]
+    groups
+        Subset of groups, e.g. `['g1', 'g2', 'g3']`, to which comparison shall
+        be restricted, or `'all'` (default), for all groups.
     cofactors
         Additional columns to include into the model
     layer
@@ -164,6 +185,10 @@ def edger(
         Number of cores to run per job (including BLAS parallelization)
     n_jobs
         Number of tests to run in parallel.
+
+    Returns
+    -------
+    DataFrame with differential expression results
     """
 
     try:
@@ -184,36 +209,44 @@ def edger(
     except ImportError:
         raise ImportError(
             "edgeR requires a valid R installation with the following packages: "
-            "edgeR"
+            "edgeR, BiocParallel, RhpcBLASctl"
         )
 
+    # Set parallelism
     blasctl.blas_set_num_threads(n_cores_per_job)
     blasctl.omp_set_num_threads(n_cores_per_job)
-    logging.info("Preparing R objects")
-
-    # Define model formula
-    cofactors = [] if cofactors is None else _make_names(cofactors)
-    groupby = _make_names([groupby])[0]
-    model = f"~ 0 + {groupby} + {' + '.join(cofactors)}"
-    contrasts = _fix_contrasts(contrasts, groupby)
-
     bcparallel.register(bcparallel.MulticoreParam(n_jobs))
 
-    with localconverter(ro.default_converter + pandas2ri.converter):
-        tmp_obs = adata.obs.loc[:, [groupby] + cofactors]
-        tmp_obs.columns = _make_names(tmp_obs.columns)
-        for col in tmp_obs.columns:
-            if not is_numeric_dtype(tmp_obs[col]):
-                tmp_obs[col] = _make_names(tmp_obs[col])
+    logging.info("Preparing R objects")
+    cofactor_formula = (
+        "" if cofactors is None else f"+ {' + '.join(_make_names(cofactors))}"
+    )
+    groupby = _make_names(groupby)
+    model = f"~ 0 + {groupby} {cofactor_formula}"
+    tmp_adata = (
+        adata if groups == "all" else adata[adata.obs[groupby].isin(groups), :]
+    ).copy()
+    tmp_adata.obs.columns = _make_names(tmp_adata.obs.columns)
+    for col in tmp_adata.obs.columns:
+        if not is_numeric_dtype(tmp_adata.obs[col]):
+            tmp_adata.obs[col] = _make_names(tmp_adata.obs[col])
+    groups = tmp_adata.obs[groupby].unique()
+    if len(groups) < 2:
+        raise ValueError("Need at least two groups to compare. ")
 
-        obs_r = ro.conversion.py2rpy(tmp_obs)
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        obs_r = ro.conversion.py2rpy(
+            tmp_adata.obs.loc[:, [groupby] + ([] if cofactors is None else cofactors)]
+        )
         # just need the index
         var_r = ro.conversion.py2rpy(
-            pd.DataFrame({"gene_symbol": adata.var_names}, index=adata.var_names)
+            pd.DataFrame(
+                {"gene_symbol": tmp_adata.var_names}, index=tmp_adata.var_names
+            )
         )
 
     with localconverter(ro.default_converter + numpy2ri.converter):
-        expr = adata.X if layer is None else adata.layers[layer]
+        expr = tmp_adata.X if layer is None else tmp_adata.layers[layer]
         if issparse(expr):
             expr = expr.T.toarray()
         else:
@@ -226,8 +259,10 @@ def edger(
 
     contrasts_r = limma.makeContrasts(
         contrasts=[
-            f'({"+".join(b)}) / {len(b)} - ({"+".join(a)}) / {len(a)}'
-            for a, b in contrasts
+            f'({"+".join([f"{groupby}{g}" for g in groups if g != group])})'
+            f" / {len(groups) - 1}"
+            f" - {groupby}{group}"
+            for group in groups
         ],
         levels=base.colnames(design),
     )
@@ -258,7 +293,12 @@ def edger(
     with localconverter(
         ro.default_converter + numpy2ri.converter + pandas2ri.converter
     ):
-        return ro.conversion.rpy2py(ro.globalenv["de_res"])
+        de_res = ro.conversion.rpy2py(ro.globalenv["de_res"])
+
+    # TODO fix this
+    #  de_res["group"] = [groups[i] for i in de_res["contrast_idx"]]
+
+    return de_res
 
 
 def glm_gam_poi(
@@ -392,7 +432,7 @@ def mast(
     adata: AnnData,
     *,
     groupby: str,
-    # contrasts: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    groups: Union[Literal["all"], Sequence[str]],
     cofactors: Sequence[str] = None,
     layer: Optional[str] = None,
     n_cores_per_job: int = 4,
@@ -404,8 +444,9 @@ def mast(
     Requires that an R installation and the following packages are available
 
         MAST
+        BiocParallel
 
-    Install them with `conda install bioconductor-mast`.
+    Install them with `conda install bioconductor-mast bioconductor-biocparallel`.
 
     Parameters
     ----------
@@ -427,26 +468,22 @@ def mast(
 
     try:
         from rpy2.robjects.packages import importr
-        from rpy2.robjects import pandas2ri, numpy2ri
+        from rpy2.robjects import pandas2ri
         from rpy2.robjects.conversion import localconverter
         from rpy2 import robjects as ro
         import anndata2ri
-
     except ImportError:
-        raise ImportError("edger requires rpy2 to be installed. ")
+        raise ImportError("MAST requires rpy2 and anndata2ri to be installed. ")
 
     try:
         mast = importr("MAST")
-        blasctl = importr("RhpcBLASctl")
         bcparallel = importr("BiocParallel")
     except ImportError:
         raise ImportError(
-            "GlmGamPoi requires a valid R installation with the following packages: "
-            "glmGamPoi, BiocParallal, RhpcBLASctl"
+            "MAST requires a valid R installation with the following packages: "
+            "MAST, BiocParallel"
         )
 
-    blasctl.blas_set_num_threads(1)
-    blasctl.omp_set_num_threads(1)
     bcparallel.register(bcparallel.MulticoreParam(n_jobs))
 
     logging.info("Preparing AnnData")
@@ -467,10 +504,9 @@ def mast(
         sce = ro.conversion.py2rpy(tmp_adata)
     sca = mast.SceToSingleCellAssay(sce)
     groupby = _make_names([groupby])[0]
-    if cofactors is not None:
-        cofactor_formula = "+ " + " + ".join(_make_names(cofactors))
-    else:
-        cofactor_formula = ""
+    cofactor_formula = (
+        "" if cofactors is None else "+ " + " + ".join(_make_names(cofactors))
+    )
 
     logging.info("Running MAST")
     ro.globalenv["cpus_per_thread"] = n_cores_per_job

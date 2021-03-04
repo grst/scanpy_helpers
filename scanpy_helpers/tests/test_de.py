@@ -12,30 +12,33 @@ def adata():
     return tmp_adata
 
 
-def test_edger(adata):
+@pytest.mark.parametrize("cofactors", [None, ["n_genes", "percent_mito"]])
+def test_edger(adata, cofactors):
     edger(
         adata,
         groupby="bulk_labels",
-        cofactors=["n_genes", "percent_mito"],
-        contrasts=[("Dendritic", "CD19+ B")],
+        cofactors=cofactors,
+        groups=("Dendritic", "CD19+ B"),
     )
 
 
-def test_glmgampoi(adata):
+@pytest.mark.parametrize("cofactors", [None, ["n_genes", "percent_mito"]])
+def test_glmgampoi(adata, cofactors):
     glm_gam_poi(
         adata,
         groupby="bulk_labels",
-        cofactors=["n_genes", "percent_mito"],
-        contrasts=[("Dendritic", "CD19+ B")],
+        cofactors=cofactors,
+        groups=("Dendritic", "CD19+ B"),
     )
 
 
-def test_mast(adata):
+@pytest.mark.parametrize("cofactors", [None, ["n_genes", "percent_mito"]])
+def test_mast(adata, cofactors):
     sc.pp.normalize_total(adata)
     sc.pp.log1p(adata)
-    adata = adata[adata.obs["bulk_labels"].isin(["Dendritic", "CD19+ B"]), :].copy()
     mast(
         adata,
         groupby="bulk_labels",
-        cofactors=["n_genes", "percent_mito"],
+        cofactors=cofactors,
+        groups=("Dendritic", "CD19+ B"),
     )
