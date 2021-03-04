@@ -4,6 +4,20 @@ Scanpy helper functions
 A bunch of custom helper functions to help with cell type annotation 
 and dataset integration.
 
+Installation
+------------
+
+Development install using 
+
+```bash
+git clone git@github.com:grst/scanpy_helpers.git
+cd scanpy_helpers
+flit install -s
+```
+
+This is still evolving, no stable version identifiers are available. 
+Consider adding as a git submodule to your project. 
+
 Modules
 -------
 
